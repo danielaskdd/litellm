@@ -2,9 +2,10 @@ services:
   litellm:
     build:
       context: .
+      dockerfile: docker/Dockerfile.non_root
+      target: runtime
       args:
         PROXY_EXTRAS_SOURCE: local
-        target: runtime
     image: ghcr.io/danielaskdd/litellm/litellm:main-stable
     #########################################
     ## Uncomment these lines to start proxy with a config.yaml file ##
