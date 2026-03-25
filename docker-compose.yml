@@ -3,6 +3,7 @@ services:
     build:
       context: .
       args:
+        PROXY_EXTRAS_SOURCE: local
         target: runtime
     image: ghcr.io/danielaskdd/litellm/litellm:main-stable
     #########################################
