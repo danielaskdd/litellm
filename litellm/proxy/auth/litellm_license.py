@@ -40,8 +40,8 @@ class LicenseCheck:
             expiration_date=(datetime.now() + timedelta(days=36500)).strftime("%Y-%m-%d"),  # 100 years
             user_id="dev_enterprise_user",
             allowed_features=["all"],
-            max_users=10,      # User limit
-            max_teams=100      # Team limit
+            max_users=100,      # User limit
+            max_teams=200      # Team limit
         )
 
     def read_public_key(self):
