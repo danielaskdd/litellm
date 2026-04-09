@@ -1,0 +1,12 @@
+services:
+  litellm:
+    image: ghcr.io/danielaskdd/litellm/litellm:main-stable
+    volumes:
+     - ./config.yaml:/app/config.yaml
+    command:
+     - "--config=/app/config.yaml"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  prometheus:
+    deploy:
+      replicas: 0
