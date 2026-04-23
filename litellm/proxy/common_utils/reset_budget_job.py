@@ -632,22 +632,27 @@ class ResetBudgetJob:
 
         now = datetime.utcnow()
 
+        # Use query_raw to push the "budget_limits IS NOT NULL" filter to the DB
+        # and project only the two columns we need. The ORM path is blocked here:
+        # prisma-client-py rejects {"not": None} on Json? fields and has no
+        # select= kwarg, so a plain find_many() would scan both wide tables in
+        # full on every tick. Updates still go through the ORM below.
+
         # --- Keys ---
         try:
-            # Avoid Prisma JSON null filters here; generated clients handle them
-            # inconsistently for optional Json fields across environments.
-            all_keys = await self.prisma_client.db.litellm_verificationtoken.find_many(
-                select={"token": True, "budget_limits": True}
+            key_rows = await self.prisma_client.db.query_raw(
+                'SELECT token, budget_limits FROM "LiteLLM_VerificationToken" '
+                "WHERE budget_limits IS NOT NULL"
             )
-            for key in all_keys:
-                raw = key.budget_limits  # type: ignore[attr-defined]
+            for key in key_rows or []:
+                raw = key["budget_limits"]
                 if not raw:
                     continue
                 windows: list = raw if isinstance(raw, list) else json.loads(raw)
                 changed = False
                 for window in windows:
                     counter_key = (
-                        f"spend:key:{key.token}:window:{window['budget_duration']}"
+                        f"spend:key:{key['token']}:window:{window['budget_duration']}"
                     )
                     if await ResetBudgetJob._reset_expired_window(
                         window, counter_key, spend_counter_cache, now
@@ -655,7 +660,7 @@ class ResetBudgetJob:
                         changed = True
                 if changed:
                     await self.prisma_client.db.litellm_verificationtoken.update(
-                        where={"token": key.token},
+                        where={"token": key["token"]},
                         data={"budget_limits": json.dumps(windows)},  # type: ignore[arg-type]
                     )
         except Exception as e:
@@ -665,20 +670,19 @@ class ResetBudgetJob:
 
         # --- Teams ---
         try:
-            # Keep the same fetch strategy as keys to avoid Json filter parsing
-            # errors on optional Prisma Json columns.
-            all_teams = await self.prisma_client.db.litellm_teamtable.find_many(
-                select={"team_id": True, "budget_limits": True}
+            team_rows = await self.prisma_client.db.query_raw(
+                'SELECT team_id, budget_limits FROM "LiteLLM_TeamTable" '
+                "WHERE budget_limits IS NOT NULL"
             )
-            for team in all_teams:
-                raw = team.budget_limits  # type: ignore[attr-defined]
+            for team in team_rows or []:
+                raw = team["budget_limits"]
                 if not raw:
                     continue
                 windows = raw if isinstance(raw, list) else json.loads(raw)
                 changed = False
                 for window in windows:
                     counter_key = (
-                        f"spend:team:{team.team_id}:window:{window['budget_duration']}"
+                        f"spend:team:{team['team_id']}:window:{window['budget_duration']}"
                     )
                     if await ResetBudgetJob._reset_expired_window(
                         window, counter_key, spend_counter_cache, now
@@ -686,7 +690,7 @@ class ResetBudgetJob:
                         changed = True
                 if changed:
                     await self.prisma_client.db.litellm_teamtable.update(
-                        where={"team_id": team.team_id},
+                        where={"team_id": team["team_id"]},
                         data={"budget_limits": json.dumps(windows)},  # type: ignore[arg-type]
                     )
         except Exception as e:
