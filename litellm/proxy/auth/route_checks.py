@@ -50,6 +50,7 @@ _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES = frozenset(
         KeyManagementRoutes.KEY_BLOCK.value,
         KeyManagementRoutes.KEY_UNBLOCK.value,
         KeyManagementRoutes.KEY_BULK_UPDATE.value,
+        KeyManagementRoutes.TEAM_KEY_BULK_UPDATE.value,
     ]
 )
 
@@ -394,7 +395,9 @@ class RouteChecks:
             return True
 
         for _llm_passthrough_route in LiteLLMRoutes.mapped_pass_through_routes.value:
-            if _llm_passthrough_route in route:
+            if route == _llm_passthrough_route or route.startswith(
+                _llm_passthrough_route + "/"
+            ):
                 return True
         return False
 
@@ -624,7 +627,11 @@ class RouteChecks:
         Returns:
             bool: True if `thread` or `assistant` is in the request path, False otherwise
         """
-        if "thread" in request.url.path or "assistant" in request.url.path:
+        # Inline import — auth_utils participates in a proxy import cycle.
+        from .auth_utils import get_request_route  # noqa: PLC0415
+
+        route = get_request_route(request)
+        if "thread" in route or "assistant" in route:
             return True
         return False
 
@@ -671,6 +678,7 @@ class RouteChecks:
             "/key/service-account/generate",
             "/key/block",
             "/key/unblock",
+            "/team/key/bulk_update",
         ]
     )
 

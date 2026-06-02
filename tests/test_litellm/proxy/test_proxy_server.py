@@ -23,6 +23,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system-path
 
 import litellm
+from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.proxy_server import app, initialize
 from litellm.utils import _invalidate_model_cost_lowercase_map
@@ -1726,6 +1727,67 @@ async def test_add_proxy_budget_to_db_only_creates_user_no_keys():
         assert call_args.kwargs["max_budget"] == 100.0
         assert call_args.kwargs["budget_duration"] == "30d"
         assert call_args.kwargs["query_type"] == "update_data"
+
+
+@pytest.mark.asyncio
+async def test_add_proxy_budget_to_db_backfills_budget_reset_at():
+    """
+    Test that _upsert_proxy_budget_with_reset_at_backfill issues a conditional
+    update_many with `WHERE budget_reset_at IS NULL` to backfill the column on
+    rows that pre-existed without a reset schedule. Without this, the proxy
+    admin row stays at NULL and reset_budget_for_litellm_users never matches
+    it (NULL < now() is unknown in SQL), so the global proxy budget never
+    resets.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import litellm
+    from litellm.proxy.proxy_server import ProxyStartupEvent
+
+    litellm.budget_duration = "30d"
+    litellm.max_budget = 100.0
+    litellm_proxy_budget_name = "litellm-proxy-budget"
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_usertable.update_many = AsyncMock(return_value={"count": 1})
+
+    mock_generate_key_helper = AsyncMock(
+        return_value={
+            "user_id": litellm_proxy_budget_name,
+            "max_budget": 100.0,
+            "budget_duration": "30d",
+            "spend": 0,
+            "models": [],
+        }
+    )
+
+    with (
+        patch(
+            "litellm.proxy.proxy_server.generate_key_helper_fn",
+            mock_generate_key_helper,
+        ),
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+    ):
+        await ProxyStartupEvent._upsert_proxy_budget_with_reset_at_backfill(
+            litellm_proxy_budget_name
+        )
+
+    # Upsert ran with the configured budget
+    mock_generate_key_helper.assert_called_once()
+
+    # Backfill update_many ran with the conditional WHERE
+    mock_prisma.db.litellm_usertable.update_many.assert_called_once()
+    backfill_call = mock_prisma.db.litellm_usertable.update_many.call_args
+    assert backfill_call.kwargs["where"]["user_id"] == litellm_proxy_budget_name
+    assert backfill_call.kwargs["where"]["budget_reset_at"] is None
+
+    # The backfilled value must be a real future datetime — anything else and
+    # reset_budget_for_litellm_users would still skip the row.
+    from datetime import datetime, timezone
+
+    backfilled_reset_at = backfill_call.kwargs["data"]["budget_reset_at"]
+    assert isinstance(backfilled_reset_at, datetime)
+    assert backfilled_reset_at > datetime.now(timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -5036,6 +5098,7 @@ async def test_init_and_increment_spend_counter_reseeds_from_db_on_counter_miss(
     fake_redis = AsyncMock()
     fake_redis.async_increment = AsyncMock(side_effect=record_increment)
     fake_redis.async_get_cache = AsyncMock(return_value=None)  # counter missing
+    fake_redis.async_set_cache = AsyncMock(return_value=True)  # SET NX wins
     counter_cache.redis_cache = fake_redis
 
     # Prisma returns spend=42.0 (authoritative) while the stale cached
@@ -5072,14 +5135,129 @@ async def test_init_and_increment_spend_counter_reseeds_from_db_on_counter_miss(
         fake_prisma.db.litellm_teamtable.find_unique.assert_awaited_once_with(
             where={"team_id": "team-9"}
         )
-        # Two increments keyed on the counter: seed ($42) then request ($1.50).
+        # Seed uses SET NX with db_spend (42) — cross-pod safe, no INCR of 42.
+        # Only the per-request delta (1.5) goes through INCRBYFLOAT.
+        fake_redis.async_set_cache.assert_awaited_once_with(
+            key="spend:team:team-9", value=42.0, nx=True
+        )
         writes = [(c["key"], c["value"]) for c in recorded_increments]
-        assert ("spend:team:team-9", 42.0) in writes
-        assert ("spend:team:team-9", 1.5) in writes
+        assert writes == [("spend:team:team-9", 1.5)]
     finally:
         ps.user_api_key_cache = orig_user
         ps.spend_counter_cache = orig_counter
         ps.prisma_client = orig_prisma
+
+
+@pytest.mark.asyncio
+async def test_primary_spend_counter_redis_concurrent_seed_does_not_double_seed():
+    """Two pods both observing a missing Redis counter must not both
+    INCRBYFLOAT the full DB spend. SpendCounterReseed.coalesced uses SET NX
+    so the loser reads the winner's value; final Redis = db_spend, not
+    2 * db_spend.
+
+    The per-counter asyncio.Lock is per-process, so it does NOT coordinate
+    across pods. We simulate two pods by patching _get_lock to return a
+    fresh lock per call (each "pod" has its own lock registry in real life).
+    """
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.db.spend_counter_reseed import SpendCounterReseed
+
+    counter_key = "spend:team:team-concurrent-seed"
+    redis_store: dict = {}
+    db_read_count = 0
+    set_results: list = []
+    get_after_set_count = 0
+    set_completed_count = 0
+
+    async def redis_set_cache(key, value, nx=False, **_):
+        # Yield BEFORE the membership check so two concurrent callers
+        # interleave the way real atomic Redis SET NX does: the first
+        # to resume runs check + write atomically and wins; the second
+        # resumes after the key exists and loses. Yielding *after* the
+        # check would let both callers pass the empty-store check before
+        # either writes, so neither would ever lose.
+        await asyncio.sleep(0)
+        if nx and key in redis_store:
+            set_results.append(False)
+            return False
+        redis_store[key] = float(value)
+        set_results.append(True)
+        nonlocal set_completed_count
+        set_completed_count += 1
+        return True
+
+    async def redis_get_cache(key):
+        # Track reads that happen after at least one SET NX has completed
+        # — those are the loser-path fallback reads we want to verify.
+        if set_completed_count > 0:
+            nonlocal get_after_set_count
+            get_after_set_count += 1
+        return redis_store.get(key)
+
+    fake_redis = AsyncMock()
+    fake_redis.async_get_cache = AsyncMock(side_effect=redis_get_cache)
+    fake_redis.async_set_cache = AsyncMock(side_effect=redis_set_cache)
+
+    async def slow_find_unique(**_):
+        nonlocal db_read_count
+        db_read_count += 1
+        # Both pods read DB before either's SET NX lands.
+        await asyncio.sleep(0)
+        row = MagicMock()
+        row.spend = 506.0
+        return row
+
+    fake_prisma = MagicMock()
+    fake_prisma.db.litellm_teamtable.find_unique = AsyncMock(
+        side_effect=slow_find_unique
+    )
+
+    pod_a = DualCache()
+    pod_a.redis_cache = fake_redis
+    pod_b = DualCache()
+    pod_b.redis_cache = fake_redis
+
+    # Each "pod" has its own per-process lock registry. Patch _get_lock to
+    # always return a fresh lock so the two coalesced calls do not serialize
+    # via one in-process lock (which is what would happen across pods).
+    async def fresh_lock(_counter_key):
+        return asyncio.Lock()
+
+    with patch.object(SpendCounterReseed, "_get_lock", side_effect=fresh_lock):
+        results = await asyncio.gather(
+            SpendCounterReseed.coalesced(
+                prisma_client=fake_prisma,
+                spend_counter_cache=pod_a,
+                counter_key=counter_key,
+            ),
+            SpendCounterReseed.coalesced(
+                prisma_client=fake_prisma,
+                spend_counter_cache=pod_b,
+                counter_key=counter_key,
+            ),
+        )
+
+    assert all(r == 506.0 for r in results), results
+    assert redis_store[counter_key] == pytest.approx(506.0), redis_store
+    # Both pods read the DB and both attempted SET NX; exactly one wrote
+    # (winner) and one was rejected (loser).
+    assert db_read_count == 2
+    assert fake_redis.async_set_cache.await_count == 2
+    nx_writes = [
+        call
+        for call in fake_redis.async_set_cache.await_args_list
+        if call.kwargs.get("nx") is True
+    ]
+    assert len(nx_writes) == 2
+    assert sorted(set_results) == [False, True], (
+        f"expected exactly one SET NX winner and one loser, got {set_results}"
+    )
+    # Loser path executed: after the winner's SET NX returned True, the
+    # losing coalesced() call falls back to async_get_cache to read the
+    # winner's value rather than re-seeding.
+    assert get_after_set_count >= 1, (
+        "loser branch (else: read back winner's value) was never exercised"
+    )
 
 
 @pytest.mark.asyncio
@@ -5205,9 +5383,16 @@ async def test_init_spend_counter_redis_clean_miss_skips_stale_in_memory():
         redis_store[key] = (redis_store.get(key) or 0.0) + value
         return redis_store[key]
 
+    async def redis_set_cache(key, value, nx=False, **_):
+        if nx and key in redis_store:
+            return False
+        redis_store[key] = float(value)
+        return True
+
     fake_redis = AsyncMock()
     fake_redis.async_get_cache = AsyncMock(return_value=None)
     fake_redis.async_increment = AsyncMock(side_effect=redis_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=redis_set_cache)
     counter_cache.redis_cache = fake_redis
 
     db_row = MagicMock()
@@ -5235,6 +5420,7 @@ async def test_init_spend_counter_redis_clean_miss_skips_stale_in_memory():
         fake_prisma.db.litellm_teamtable.find_unique.assert_awaited_once_with(
             where={"team_id": "team-stale-local"}
         )
+        # Seed via SET NX (42) + delta via INCRBYFLOAT (1.5) = 43.5.
         assert redis_store[counter_key] == pytest.approx(43.5)
         assert counter_cache.in_memory_cache.get_cache(
             key=counter_key
@@ -5625,14 +5811,14 @@ async def test_get_current_spend_reseeds_from_db_when_counter_missing():
     from litellm.proxy.proxy_server import get_current_spend
 
     counter_cache = DualCache()
-    recorded_warms: list = []
+    recorded_seeds: list = []
 
-    async def record_increment(key, value, ttl=None, **kwargs):
-        recorded_warms.append({"key": key, "value": value})
-        return value
+    async def record_set_cache(key, value, nx=False, **kwargs):
+        recorded_seeds.append({"key": key, "value": value, "nx": nx})
+        return True
 
     fake_redis = AsyncMock()
-    fake_redis.async_increment = AsyncMock(side_effect=record_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=record_set_cache)
     fake_redis.async_get_cache = AsyncMock(return_value=None)
     counter_cache.redis_cache = fake_redis
 
@@ -5657,9 +5843,9 @@ async def test_get_current_spend_reseeds_from_db_when_counter_missing():
             f"expected DB reseed to return 362.0, got {spend} "
             f"(fallback would have returned 30.0 and caused bypass)"
         )
-        # Counter warmed so subsequent reads are fast
-        assert ("spend:team_member:user-1:team-1", 362.0) in [
-            (w["key"], w["value"]) for w in recorded_warms
+        # Counter warmed via SET NX so subsequent reads are fast.
+        assert ("spend:team_member:user-1:team-1", 362.0, True) in [
+            (s["key"], s["value"], s["nx"]) for s in recorded_seeds
         ]
         assert counter_cache.in_memory_cache.get_cache(
             key="spend:team_member:user-1:team-1"
@@ -5736,8 +5922,15 @@ async def test_get_current_spend_coalesces_concurrent_reseeds():
         redis_store[key] = (redis_store.get(key) or 0.0) + value
         return redis_store[key]
 
+    async def redis_set_cache(key, value, nx=False, **_):
+        if nx and key in redis_store:
+            return False
+        redis_store[key] = float(value)
+        return True
+
     fake_redis.async_get_cache = AsyncMock(side_effect=redis_get)
     fake_redis.async_increment = AsyncMock(side_effect=redis_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=redis_set_cache)
     counter_cache.redis_cache = fake_redis
 
     fake_prisma = MagicMock()
@@ -5844,9 +6037,16 @@ async def test_concurrent_read_and_write_paths_share_one_db_query():
         redis_store[key] = (redis_store.get(key) or 0.0) + value
         return redis_store[key]
 
+    async def redis_set_cache(key, value, nx=False, **_):
+        if nx and key in redis_store:
+            return False
+        redis_store[key] = float(value)
+        return True
+
     fake_redis = AsyncMock()
     fake_redis.async_get_cache = AsyncMock(side_effect=redis_get)
     fake_redis.async_increment = AsyncMock(side_effect=redis_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=redis_set_cache)
     counter_cache.redis_cache = fake_redis
 
     fake_prisma = MagicMock()
@@ -5949,9 +6149,16 @@ async def test_reseed_warms_cache_even_on_zero_db_spend():
         redis_store[key] = (redis_store.get(key) or 0.0) + value
         return redis_store[key]
 
+    async def redis_set_cache(key, value, nx=False, **_):
+        if nx and key in redis_store:
+            return False
+        redis_store[key] = float(value)
+        return True
+
     fake_redis = AsyncMock()
     fake_redis.async_get_cache = AsyncMock(side_effect=redis_get)
     fake_redis.async_increment = AsyncMock(side_effect=redis_increment)
+    fake_redis.async_set_cache = AsyncMock(side_effect=redis_set_cache)
     counter_cache.redis_cache = fake_redis
 
     db_call_count = 0
@@ -6318,6 +6525,84 @@ class TestLazyFeatureMiddleware:
         assert loads == ["json"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "server_root_path,request_path,should_load,case",
+        [
+            # SERVER_ROOT_PATH set: incoming path includes prefix → strip and match.
+            ("/api/v1", "/api/v1/dummy/x", True, "root_path strip + match"),
+            # Trailing-slash env var must be normalized.
+            ("/api/v1/", "/api/v1/dummy/x", True, "trailing-slash env normalization"),
+            # Reverse proxy already stripped the prefix → original path still matches.
+            ("/api/v1", "/dummy/x", True, "pre-stripped path still loads"),
+            # No SERVER_ROOT_PATH set → unchanged behavior.
+            ("", "/dummy/x", True, "no root path"),
+            # SERVER_ROOT_PATH=/ must be a no-op (not strip every leading slash).
+            ("/", "/dummy/x", True, "root_path='/' is no-op"),
+            # Boundary check: /apiv2 must not match root /api.
+            ("/api", "/apiv2/foo", False, "boundary check prevents false match"),
+            # Genuine non-match under root_path.
+            ("/api/v1", "/api/v1/unrelated", False, "unrelated path under root"),
+        ],
+    )
+    async def test_root_path_handling(
+        self, monkeypatch, server_root_path, request_path, should_load, case
+    ):
+        """
+        The middleware must strip SERVER_ROOT_PATH before prefix-matching so
+        lazy features load under deployments that set a server root path,
+        while handling boundary, trailing-slash, and reverse-proxy edge cases
+        correctly.
+        """
+        from fastapi import FastAPI
+
+        from litellm.proxy._lazy_features import (
+            LazyFeature,
+            LazyFeatureMiddleware,
+        )
+
+        monkeypatch.setenv("SERVER_ROOT_PATH", server_root_path)
+
+        loads = []
+
+        def fake_register(app, module):
+            loads.append(getattr(module, "__name__", "?"))
+
+        feat = LazyFeature(
+            name=f"dummy_{case}",
+            module_path="json",
+            path_prefixes=("/dummy",),
+            register_fn=fake_register,
+        )
+
+        async def downstream(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        target_app = FastAPI()
+        mw = LazyFeatureMiddleware(downstream, fastapi_app=target_app, features=(feat,))
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        await mw(
+            {
+                "type": "http",
+                "path": request_path,
+                "method": "GET",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+        if should_load:
+            assert loads == ["json"], f"{case}: expected feature to load"
+        else:
+            assert loads == [], f"{case}: feature must not load"
+
+    @pytest.mark.asyncio
     async def test_concurrent_first_requests_only_register_once(self):
         """
         Two requests to the same prefix arriving in parallel must result in
@@ -6513,3 +6798,86 @@ async def test_get_current_spend_redis_error_falls_back_to_in_memory():
     finally:
         ps.spend_counter_cache = orig_counter
         ps.prisma_client = orig_prisma
+
+
+def test_realtime_websocket_route_aliases_registered():
+    """Realtime sessions reach the proxy via three path aliases stacked on
+    `realtime_websocket_endpoint`. Dropping any of them silently 405s
+    WebSocket upgrades because the catch-all `/openai/{endpoint:path}`
+    HTTP passthrough only declares HTTP methods. The aliases must also be
+    in `LiteLLMRoutes.openai_routes` (so non-admin / team / key-scoped
+    auth allows them) and in `API_ROUTE_TO_CALL_TYPES` (so call-type-aware
+    logic such as guardrails can resolve the realtime call type)."""
+    from starlette.routing import WebSocketRoute
+
+    from litellm.proxy._types import LiteLLMRoutes
+    from litellm.proxy.proxy_server import app
+    from litellm.types.utils import API_ROUTE_TO_CALL_TYPES, CallTypes
+
+    websocket_paths = {
+        route.path for route in app.routes if isinstance(route, WebSocketRoute)
+    }
+    openai_routes = LiteLLMRoutes.openai_routes.value
+
+    for expected in ("/openai/v1/realtime", "/v1/realtime", "/realtime"):
+        assert expected in websocket_paths, (
+            f"{expected!r} missing from registered WebSocket routes; the "
+            f"realtime endpoint will 405 for clients hitting this path."
+        )
+        assert expected in openai_routes, (
+            f"{expected!r} missing from LiteLLMRoutes.openai_routes; "
+            f"non-admin / team / key-scoped users will get 403 on this path."
+        )
+        assert API_ROUTE_TO_CALL_TYPES.get(expected) == [CallTypes.arealtime], (
+            f"{expected!r} missing from API_ROUTE_TO_CALL_TYPES; call-type "
+            f"resolution will return None and break call-type-aware features."
+        )
+
+
+class TestTransformRequestBannedParams:
+    """
+    /utils/transform_request applies the same banned-param check as LLM endpoints.
+
+    Without this check, any authenticated user could supply aws_sts_endpoint,
+    api_base, etc. and have the server forward its credentials to an
+    attacker-controlled endpoint during SDK credential resolution.
+    """
+
+    @pytest.fixture
+    def client(self):
+        mock_auth = UserAPIKeyAuth(
+            user_id="test-internal",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+        original = app.dependency_overrides.copy()
+        app.dependency_overrides[user_api_key_auth] = lambda: mock_auth
+        try:
+            yield TestClient(app)
+        finally:
+            app.dependency_overrides = original
+
+    @pytest.mark.parametrize(
+        "banned",
+        [
+            "aws_sts_endpoint",
+            "api_base",
+            "aws_web_identity_token",
+            "vertex_credentials",
+        ],
+    )
+    def test_banned_params_rejected_for_all_users(self, client, banned):
+        """Banned params must be blocked for any authenticated user."""
+        response = client.post(
+            "/utils/transform_request",
+            json={
+                "call_type": "completion",
+                "request_body": {
+                    "model": "gpt-3.5-turbo",
+                    banned: "https://attacker.example",
+                },
+            },
+        )
+        assert response.status_code == 400, (
+            f"Expected 400 for banned param '{banned}', "
+            f"got {response.status_code}: {response.json()}"
+        )
