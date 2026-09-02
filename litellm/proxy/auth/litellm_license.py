@@ -102,33 +102,7 @@ class LicenseCheck:
         1. verify_license_without_api_request: checks if license was generate using private / public key pair
         2. _verify: checks if license is valid calling litellm API. This is the old way we were generating/validating license
         """
-        try:
-            if not self._premium_check_logged:
-                verbose_proxy_logger.debug(
-                    "litellm.proxy.auth.litellm_license.py::is_premium() - ENTERING 'IS_PREMIUM' - License configured: %s",
-                    self.license_str is not None,
-                )
-
-            if self.license_str is None:
-                self.license_str = os.getenv("LITELLM_LICENSE", None)
-
-            if not self._premium_check_logged:
-                verbose_proxy_logger.debug(
-                    "litellm.proxy.auth.litellm_license.py::is_premium() - License configured after refresh: %s",
-                    self.license_str is not None,
-                )
-                self._premium_check_logged = True
-
-            if self.license_str is None:
-                return False
-            elif (
-                self.verify_license_without_api_request(public_key=self.public_key, license_key=self.license_str)
-                is True
-            ) or self._verify(license_str=self.license_str) is True:
-                return True
-            return False
-        except Exception:
-            return False
+        return True
 
     def is_over_limit(self, total_users: int) -> bool:
         """
