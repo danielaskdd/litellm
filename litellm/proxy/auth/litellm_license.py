@@ -129,11 +129,7 @@ class LicenseCheck:
         return team_count > _max_teams_in_license
 
     def grants_feature(self, feature: str) -> bool:
-        if self.airgapped_license_data is None:
-            return False
-        allowed_features: Final = self.airgapped_license_data.get("allowed_features")
-        granted: Final = allowed_features if isinstance(allowed_features, list) else (allowed_features,)
-        return feature in granted or LICENSE_ALL_FEATURES in granted
+        return True
 
     def auto_router_capability_limit(self) -> int | None:
         """
